@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "UnitTesting-Tests",
+			"path": "..\\UnitTesting-Tests"
+		}
+	],
+	"settings": {
+		"dataworkspace.projects": [
+			"UnitTesting-Data.sqlproj",
+			"..\\UnitTesting-Tests\\UnitTesting-Tests.sqlproj"
+		]
+	}
+}

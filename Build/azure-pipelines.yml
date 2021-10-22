@@ -1,0 +1,628 @@
+﻿# SSDT Building and testing pipeline
+#
+# The project is based on the SSDT-With-tSQLt-Template from https://github.com/sanderstad/SSDT-With-tSQLt-Template
+#
+# The container image used is build from
+# - SQL Server 2017 CU16 image
+# - SQL Server 2019 GA image
+
+variables:
+  configuration: release
+  sqlinstance: localhost
+  database: UnitTesting
+  azuredatabase: Azure-Data
+  artifactname: Database
+  azureartifactname: AzureSQLDB
+  azuremidatabase: AzureSQLMI
+  miartifactname: AzureSQLMI
+  azuresyndatabase: AzureSQLPool
+  sqlpoolartifactname: AzureSQLPool
+
+
+trigger:
+  branches:
+    include:
+    - main
+  paths: 
+    exclude:
+    - transform-pipelines.yml   
+
+stages:
+- stage: Build
+
+  jobs:
+    - job: 'Solution'
+      variables:
+        agentpool: 'Azure DevOps Duet'
+      pool: 
+        name: $(agentpool)
+        demands:
+          - Docker.Host
+
+      steps:
+      - task: VSBuild@1
+        displayName: 'Build UnitTesting-Data project'
+        inputs:
+          solution: UnitTesting-Data/UnitTesting-Data.sqlproj
+          configuration: $(configuration)
+
+      - task: VSBuild@1
+        displayName: 'Build UnitTesting-Tests project'
+        inputs:
+          solution: UnitTesting-Tests/UnitTesting-Tests.sqlproj
+          configuration: $(configuration)
+
+      - task: CopyFiles@2
+        displayName: "Copy files to artifact directory"
+        inputs:
+          Contents: |
+            **\$(database)-Data\bin\$(configuration)\*.*
+            **\$(database)-Tests\bin\$(configuration)\*.*
+            **\$(database)-Data\*.publish.xml
+            **\$(database)-Tests\*.publish.xml
+          TargetFolder: '$(Build.ArtifactStagingDirectory)'
+          FlattenFolders: true
+          OverWrite: true
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish artifact'
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: $(artifactname)
+          publishLocation: 'Container'
+- stage: Test
+  displayName: 'Unit Testing'
+  jobs:
+    - job: 'UnitTesting'
+      displayName: 'SQL Server 2019'
+      variables:
+        variables:
+        dockerimage: 'mcr.microsoft.com/mssql/server:2019-GA-ubuntu-16.04'
+        dockerpublishport: 1433
+        dockername: sql2019
+        dockersqlpw: 'MyP@ssw0rd12345'
+        dacpacpath: $(System.ArtifactsDirectory)\$(artifactname)
+        testresultpath: $(Build.Repository.LocalPath)\build\sql2019
+        datadacpacfile: $(dacpacpath)\$(database)-Data.dacpac
+        testdacpacfile: $(dacpacpath)\$(database)-Tests.dacpac
+        datapublishfile: $(dacpacpath)\$(database)-Data.publish.xml
+        testpublishfile: $(dacpacpath)\$(database)-Tests.publish.xml
+        unittestinstance: 'localhost,1442'
+        agentpool: 'Azure DevOps Duet'
+
+      pool: 
+        name: $(agentpool)
+        demands:
+          - Docker.Host
+
+      steps:
+      - task: PowerShell@2
+        displayName: 'Prerequisites'
+        inputs:
+          filePath: 'Build\azure-prerequisites.ps1'
+
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlDacpacDeploymentOnMachineGroup@0
+        displayName: 'Install DACPAC'
+        inputs:
+          TaskType: 'dacpac'
+          DacpacFile: '$(datadacpacfile)'
+          TargetMethod: 'server'
+          ServerName: '$(unittestinstance)'
+          DatabaseName: 'UnitTesting'
+          AuthScheme: 'sqlServerAuthentication'
+          SqlUsername: 'sa'
+          SqlPassword: $(sqlsapw)
+          PublishProfile: $(datapublishfile)
+          AdditionalArguments: '/p:IncludeCompositeObjects=true'
+
+      - task: SqlDacpacDeploymentOnMachineGroup@0
+        displayName: 'Install DACPAC'
+        inputs:
+          TaskType: 'dacpac'
+          DacpacFile: '$(testdacpacfile)'
+          TargetMethod: 'server'
+          ServerName: '$(unittestinstance)'
+          DatabaseName: 'UnitTesting'
+          AuthScheme: 'sqlServerAuthentication'
+          SqlUsername: 'sa'
+          SqlPassword: $(sqlsapw)
+          PublishProfile: $(testpublishfile)
+          AdditionalArguments: '/p:IncludeCompositeObjects=true'
+
+      - task: PowerShell@2
+        displayName: 'Run Tests'
+        inputs:
+          filePath: 'Build\azure-validate.ps1'
+          arguments: '-SqlInstance "$(unittestinstance)" -SqlPassword "$(sqlsapw)" -Database "UnitTesting" -TestResultPath "$(testresultpath)" -EnableException'
+
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '$(testresultpath)\TEST-*.xml'
+          failTaskOnFailedTests: true
+          testRunTitle: 'SQL Server 2019'
+          
+- stage: Integration
+  displayName: 'SQL 2019 Integration'
+
+  jobs:
+    - job: 'Deploy2019'
+      displayName: 'Deploy SQL Server 2019'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        dacpacpath: $(System.ArtifactsDirectory)/$(artifactname)
+        datadacpacfile: $(database)-Data.dacpac
+        datapublishfile: $(dacpacpath)/$(database)-Data.publish.xml
+
+
+      pool: 
+        name: $(agentpool)
+        demands:
+          - Docker.Host
+        
+      steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlDacpacDeploymentOnMachineGroup@0
+        displayName: 'Install DACPAC'
+        inputs:
+          TaskType: 'dacpac'
+          DacpacFile: '$(dacpacpath)/$(datadacpacfile)'
+          TargetMethod: 'server'
+          ServerName: 'localhost,1443'
+          DatabaseName: 'Integration'
+          AuthScheme: 'sqlServerAuthentication'
+          SqlUsername: 'sa'
+          SqlPassword: $(sqlsapw)
+          PublishProfile: $(datapublishfile)
+          AdditionalArguments: '/p:IncludeCompositeObjects=true'
+
+- stage: Staging
+  displayName: 'SQL 2019 Staging'
+
+  jobs:
+    - job: 'Deploy2019'
+      displayName: 'Deploy SQL Server 2019'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        dacpacpath: $(System.ArtifactsDirectory)/$(artifactname)
+        datadacpacfile: $(database)-Data.dacpac
+        datapublishfile: $(dacpacpath)/$(database)-Data.publish.xml
+
+
+      pool: 
+        name: $(agentpool)
+        demands:
+          - Docker.Host
+        
+      steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlDacpacDeploymentOnMachineGroup@0
+        displayName: 'Install DACPAC'
+        inputs:
+          TaskType: 'dacpac'
+          DacpacFile: '$(dacpacpath)/$(datadacpacfile)'
+          TargetMethod: 'server'
+          ServerName: 'localhost,1444'
+          DatabaseName: 'Staging'
+          AuthScheme: 'sqlServerAuthentication'
+          SqlUsername: 'sa'
+          SqlPassword: $(sqlsapw)
+          PublishProfile: $(datapublishfile)
+          AdditionalArguments: '/p:IncludeCompositeObjects=true'
+
+- stage: Production
+  displayName: 'SQL 2019 Production'
+
+  jobs:
+    - job: 'Deploy2019'
+      displayName: 'Deploy SQL Server 2019'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        dacpacpath: $(System.ArtifactsDirectory)/$(artifactname)
+        datadacpacfile: $(database)-Data.dacpac
+        datapublishfile: $(dacpacpath)/$(database)-Data.publish.xml
+
+
+      pool: 
+        name: $(agentpool)
+        demands:
+          - Docker.Host
+        
+      steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlDacpacDeploymentOnMachineGroup@0
+        displayName: 'Install DACPAC on Prod1'
+        inputs:
+          TaskType: 'dacpac'
+          DacpacFile: '$(dacpacpath)/$(datadacpacfile)'
+          TargetMethod: 'server'
+          ServerName: 'localhost,1445'
+          DatabaseName: 'Prod-AzureDevOps'
+          AuthScheme: 'sqlServerAuthentication'
+          SqlUsername: 'sa'
+          SqlPassword: $(sqlsapw)
+          PublishProfile: $(datapublishfile)
+          AdditionalArguments: '/p:IncludeCompositeObjects=true'
+
+
+- stage: GitHub
+  displayName: 'Sync to GitHub'
+  dependsOn: Test
+
+  jobs:
+    - job: 'SyncGit'
+      displayName: 'Sync Git to GitHub'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        artifactsfolder: 'C:\repos\Published artifacts'
+
+      pool: $(agentpool)
+        
+      steps:
+      - checkout: self
+        persistCredentials: true
+
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          downloadPath: '$(artifactsfolder)'
+
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+          
+            git push -u github head:main
+
+
+- stage: AzureBuild
+  dependsOn: Integration
+  displayName: 'Prepare files for Azure SQL DB'
+
+  jobs:
+    - job: 'BuildAzureSQLDB'
+      displayName: 'Build Azure SQL DB dacpac'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        sourcepath: $(database)-Data
+        stagingarea: $(Build.ArtifactStagingDirectory)\staging
+        destinationpath: $(azuredatabase)
+        dacpacpath: $(System.ArtifactsDirectory)/$(artifactname)
+        datadacpacfile: $(azuredatabase).dacpac
+        datapublishfile: $(dacpacpath)/$(azuredatabase).publish.xml
+
+      pool: $(agentpool)
+        
+      steps:
+
+      - task: CopyFiles@2
+        displayName: "Copy files to staging area for Azure-Data"
+        # Copies the file to a sub folder in the artifacts directory
+        inputs:
+          Contents: |
+            $(sourcepath)\**
+          TargetFolder: '$(stagingarea)'
+          FlattenFolders: false
+          OverWrite: true
+
+      - task: PowerShell@2
+        displayName: "Runs PowerShell to replace DSP"
+        # Renames the .sqlproj file
+        # Followed by the PowerShell to replace the Database Schema Provider
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Write your PowerShell commands here.
+            
+            cd..
+            cd a
+            cd staging\$(database)-Data
+            ls
+           
+            $Old_DSP = 'Microsoft.Data.Tools.Schema.Sql.Sql140DatabaseSchemaProvider'
+            $New_DSP = 'Microsoft.Data.Tools.Schema.Sql.SqlAzureV12DatabaseSchemaProvider'
+            
+            rename-item UnitTesting-Data.sqlproj AzureDB.sqlproj
+            rename-item UnitTesting-Data.publish.xml AzureDB.publish.xml
+            
+            (Get-Content "AzureDB.sqlproj") -replace $Old_DSP, $New_DSP  | Set-Content "AzureDB.sqlproj"
+
+      - task: VSBuild@1
+        displayName: 'Build Azure-Data project'
+        # Builds the specific project using the renamed .sqlproj file
+        inputs:
+          solution: $(stagingarea)/$(database)-Data/AzureDB.sqlproj
+          configuration: $(configuration)
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Azure SQL database artifact'
+        # Publishes the dacpac as part of an artifact within Azure DevOps
+        inputs:
+          PathtoPublish: '$(stagingarea)\$(database)-Data\bin\$(configuration)'
+          ArtifactName: $(azureartifactname)
+          publishLocation: 'Container'
+
+- stage: DeployAzureDB
+  dependsOn: AzureBuild
+  displayName: 'Azure SQL DB Deploy'
+
+  jobs:
+    - job: 'Deploy2019'
+      displayName: 'Deploy Azure SQL DB'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        dacpacpath: $(System.ArtifactsDirectory)/$(azureartifactname)
+        datadacpacfile: $(dacpacpath)/AzureDB.dacpac
+        datapublishfile: $(dacpacpath)/staging/AzureDB.publish.xml
+
+
+      pool: $(agentpool)
+        
+      steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          artifactName:  '$(azureartifactname)'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlAzureDacpacDeployment@1
+        displayName: 'Install DACPAC on Azure SQL DB'
+        inputs:
+          azureSubscription: '$(vsentsubscriptionb)'
+          AuthenticationType: 'server'
+          ServerName: 'dtdemosrv.database.windows.net'
+          DatabaseName: '$(azuredatabase)'
+          SqlUsername: '$(azureuser)'
+          SqlPassword: '$(azuresqlpw)'
+          deployType: 'DacpacTask'
+          DeploymentAction: 'Publish'
+          DacpacFile: '$(datadacpacfile)'
+
+# - stage: AzureMIBuild
+#   dependsOn: Integration
+#   displayName: 'Prepare files for Managed Instance'
+
+#   jobs:
+#     - job: 'BuildAzureSQLPool'
+#       displayName: 'Build Azure SQL Pool dacpac'
+#       variables:
+#         variables:
+#         agentpool: 'Azure DevOps Duet'
+#         sourcepath: $(database)-Data
+#         mistagingarea: $(Build.ArtifactStagingDirectory)\mistaging
+#         dacpacpath: $(System.ArtifactsDirectory)/$(miartifactname)
+#         datadacpacfile: $(azuredatabase).dacpac
+#         datapublishfile: $(dacpacpath)/$(azuredatabase).publish.xml
+
+#       # You need latest hosted windows image for this
+#       pool: $(agentpool)
+        
+#       steps:
+
+#       - task: CopyFiles@2
+#         displayName: "Copy files to staging area for SQL MI"
+#         # Copies the file to a sub folder in the artifacts directory
+#         inputs:
+#           Contents: |
+#             $(sourcepath)\**
+#           TargetFolder: '$(mistagingarea)'
+#           FlattenFolders: false
+#           OverWrite: true
+
+#       - task: PowerShell@2
+#         displayName: "Runs PowerShell to replace DSP"
+#         # Renames the .sqlproj file
+#         # Followed by the PowerShell to replace the Database Schema Provider
+#         inputs:
+#           targetType: 'inline'
+#           script: |
+#             # Write your PowerShell commands here.
+            
+#             cd..
+#             cd a
+#             cd mistaging\$(database)-Data
+           
+#             $Old_DSP = 'Microsoft.Data.Tools.Schema.Sql.Sql140DatabaseSchemaProvider'
+#             $New_DSP = 'Microsoft.Data.Tools.Schema.Sql.Sql150DatabaseSchemaProvider'
+            
+#             rename-item UnitTesting-Data.sqlproj AzureSQLMI.sqlproj
+#             rename-item UnitTesting-Data.publish.xml AzureSQLMI.publish.xml
+            
+#             (Get-Content "AzureSQLMI.sqlproj") -replace $Old_DSP, $New_DSP  | Set-Content "AzureSQLMI.sqlproj"
+
+#       - task: VSBuild@1
+#         displayName: 'Build Azure-Data project'
+#         # Builds the specific project using the renamed .sqlproj file
+#         inputs:
+#           solution: $(mistagingarea)/$(database)-Data/AzureSQLMI.sqlproj
+#           configuration: $(configuration)
+
+#       - task: PublishBuildArtifacts@1
+#         displayName: 'Publish Azure SQL Managed in artifact'
+#         # Publishes the dacpac as part of an artifact within Azure DevOps
+#         inputs:
+#           PathtoPublish: '$(mistagingarea)\$(database)-Data\bin\$(configuration)'
+#           ArtifactName: $(miartifactname)
+#           publishLocation: 'Container'
+
+# - stage: DeployAzureMI
+#   dependsOn: AzureMIBuild
+#   displayName: 'Managed Instance Deploy'
+
+#   jobs:
+#     - job: 'DeployMI'
+#       displayName: 'Deploy Azure SQL Managed Instance'
+#       variables:
+#         variables:
+#         agentpool: 'Azure DevOps Duet'
+#         dacpacpath: $(System.ArtifactsDirectory)/$(miartifactname)
+#         datadacpacfile: $(dacpacpath)/AzureSQLMI.dacpac
+#         datapublishfile: $(dacpacpath)/staging/AzureSQLMI.publish.xml
+
+#       # You need latest hosted windows image for this
+#       pool: $(agentpool)
+        
+#       steps:
+#       - task: DownloadBuildArtifacts@0
+#         displayName: 'Dowload Artifacts'
+#         inputs:
+#           buildType: 'current'
+#           downloadType: 'specific'
+#           artifactName:  '$(sqlpoolartifactname)'
+#           downloadPath: '$(System.ArtifactsDirectory)'
+
+#       - task: SqlAzureDacpacDeployment@1
+#         displayName: 'Install DACPAC on Azure SQL MI'
+#         inputs:
+#           azureSubscription: '$(vsentsubscriptionb)'
+#           AuthenticationType: 'server'
+#           ServerName: 'kcspeedmidemomi.public.94bf8aa8952e.database.windows.net,3342'
+#           DatabaseName: '$(azuremidatabase)'
+#           SqlUsername: '$(azureuser)'
+#           SqlPassword: '$(azuresqlpw)'
+#           deployType: 'DacpacTask'
+#           DeploymentAction: 'Publish'
+#           DacpacFile: '$(datadacpacfile)'
+
+# Uses 'The Kevin Method'
+- stage: AzurePoolBuild
+  dependsOn: Integration
+  displayName: 'Prepare files for SQL Pool'
+
+  jobs:
+    - job: 'BuildAzureSQLPool'
+      displayName: 'Build Azure SQL Pool dacpac'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        sourcepath: $(database)-Data
+        poolstagingarea: $(Build.ArtifactStagingDirectory)\poolstaging
+        destinationpath: $(azuredatabase)
+        dacpacpath: $(System.ArtifactsDirectory)/$(sqlpoolartifactname)
+        datadacpacfile: $(azuredatabase).dacpac
+        datapublishfile: $(dacpacpath)/$(azuredatabase).publish.xml
+
+      # You need latest hosted windows image for this
+      pool: $(agentpool)
+        
+      steps:
+
+      - task: CopyFiles@2
+        displayName: "Copy files to staging area for SQL Pool"
+        # Copies the file to a sub folder in the artifacts directory
+        inputs:
+          Contents: |
+            $(sourcepath)\**
+          TargetFolder: '$(poolstagingarea)'
+          FlattenFolders: false
+          OverWrite: true
+
+      - task: PowerShell@2
+        displayName: "Runs PowerShell to replace DSP"
+        # Renames the .sqlproj file
+        # Followed by the PowerShell to replace the Database Schema Provider
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Write your PowerShell commands here.
+            
+            cd..
+            cd a
+            cd poolstaging\$(database)-Data
+           
+            $Old_DSP = 'Microsoft.Data.Tools.Schema.Sql.Sql140DatabaseSchemaProvider'
+            $New_DSP = 'Microsoft.Data.Tools.Schema.Sql.SqlDwDatabaseSchemaProvider'
+            
+            rename-item UnitTesting-Data.sqlproj AzureSQLPool.sqlproj
+            rename-item UnitTesting-Data.publish.xml AzureSQLPool.publish.xml
+            
+            (Get-Content "AzureSQLPool.sqlproj") -replace $Old_DSP, $New_DSP  | Set-Content "AzureSQLPool.sqlproj"
+
+      - task: VSBuild@1
+        displayName: 'Build Azure-Data project'
+        # Builds the specific project using the renamed .sqlproj file
+        inputs:
+          solution: $(poolstagingarea)/$(database)-Data/AzureSQLPool.sqlproj
+          configuration: $(configuration)
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish Azure SQL database artifact'
+        # Publishes the dacpac as part of an artifact within Azure DevOps
+        inputs:
+          PathtoPublish: '$(poolstagingarea)\$(database)-Data\bin\$(configuration)'
+          ArtifactName: $(sqlpoolartifactname)
+          publishLocation: 'Container'
+
+- stage: DeployAzurePool
+  dependsOn: AzurePoolBuild
+  displayName: 'Azure SQL Pool Deploy'
+
+  jobs:
+    - job: 'Deploy2019'
+      displayName: 'Deploy Azure SQL Pool'
+      variables:
+        variables:
+        agentpool: 'Azure DevOps Duet'
+        dacpacpath: $(System.ArtifactsDirectory)/$(sqlpoolartifactname)
+        datadacpacfile: $(dacpacpath)/AzureSQLPool.dacpac
+        datapublishfile: $(dacpacpath)/staging/AzureSQLPool.publish.xml
+
+      pool: $(agentpool)
+        
+      steps:
+      - task: DownloadBuildArtifacts@0
+        displayName: 'Dowload Artifacts'
+        inputs:
+          buildType: 'current'
+          downloadType: 'specific'
+          artifactName:  '$(sqlpoolartifactname)'
+          downloadPath: '$(System.ArtifactsDirectory)'
+
+      - task: SqlAzureDacpacDeployment@1
+        displayName: 'Install DACPAC on Azure SQL DB'
+        inputs:
+          azureSubscription: '$(vsentsubscriptionb)'
+          AuthenticationType: 'server'
+          ServerName: 'dtsynapsews.sql.azuresynapse.net'
+          DatabaseName: '$(azuresyndatabase)'
+          SqlUsername: 'sqladminuser'
+          SqlPassword: '$(sqlsapw)'
+          deployType: 'DacpacTask'
+          DeploymentAction: 'Publish'
+          DacpacFile: '$(datadacpacfile)'
+
